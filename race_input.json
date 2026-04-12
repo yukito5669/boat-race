@@ -1,0 +1,16 @@
+{
+  "race_name": "サンプルレース",
+  "race_date": "2026-04-12",
+  "stadium": "大村",
+  "race_number": 12,
+  "grade": "一般",
+  "entrants": [
+    {"lane": 1, "racer_id": "4787", "racer_name": "椎名豊", "racer_rank": "A2", "odds": 1.8, "popularity": 1},
+    {"lane": 2, "racer_id": "4171", "racer_name": "榎幸司", "racer_rank": "A1", "odds": 4.5, "popularity": 2},
+    {"lane": 3, "racer_id": "3284", "racer_name": "渡邊伸太郎", "racer_rank": "B1", "odds": 8.2, "popularity": 4},
+    {"lane": 4, "racer_id": "3746", "racer_name": "岡瀬正人", "racer_rank": "B1", "odds": 12.0, "popularity": 5},
+    {"lane": 5, "racer_id": "4521", "racer_name": "小池公生", "racer_rank": "A2", "odds": 6.3, "popularity": 3},
+    {"lane": 6, "racer_id": "3711", "racer_name": "江本真治", "racer_rank": "B1", "odds": 25.0, "popularity": 6}
+  ],
+  "budget": 1000
+}

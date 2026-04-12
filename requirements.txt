@@ -1,0 +1,6 @@
+anthropic
+pandas
+numpy
+requests
+beautifulsoup4
+libsql-client

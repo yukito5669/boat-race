@@ -1,0 +1,83 @@
+name: Collect Race Data
+
+on:
+  # 毎日 00:00 JST（= 前日 15:00 UTC）に自動実行
+  # 前日のレース結果が全場確定後に収集
+  schedule:
+    - cron: "0 15 * * *"
+
+  # 手動実行
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "収集日 (YYYYMMDD, 省略時は前日)"
+        required: false
+        default: ""
+      date_range:
+        description: "期間 (YYYY-MM-DD YYYY-MM-DD, スペース区切り)"
+        required: false
+        default: ""
+      stadium:
+        description: "場コード (01-24, 省略時は全場)"
+        required: false
+        default: ""
+      force:
+        description: "強制再取得 (true / false)"
+        required: false
+        default: "false"
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect race data
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: |
+          DATE="${{ github.event.inputs.date }}"
+          DATE_RANGE="${{ github.event.inputs.date_range }}"
+          STADIUM="${{ github.event.inputs.stadium }}"
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+
+          ARGS="collect"
+
+          if [ -n "$DATE_RANGE" ]; then
+            ARGS="$ARGS --date-range $DATE_RANGE"
+          elif [ -n "$DATE" ]; then
+            ARGS="$ARGS --date $DATE"
+          else
+            # デフォルト: 前日
+            YESTERDAY=$(date -d "yesterday" +%Y%m%d 2>/dev/null || date -v-1d +%Y%m%d)
+            ARGS="$ARGS --date $YESTERDAY"
+          fi
+
+          if [ -n "$STADIUM" ]; then
+            ARGS="$ARGS --stadium $STADIUM"
+          fi
+
+          if [ "$FORCE" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+
+          echo "実行: python main.py $ARGS"
+          python main.py $ARGS
+
+      - name: Show DB stats
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: python main.py db-stats
