@@ -38,6 +38,25 @@ def cmd_db_stats(_args):
     print()
 
 
+def cmd_build_racer_master(_args):
+    from src.database import build_racer_master
+    build_racer_master()
+
+
+def cmd_collect_odds(args):
+    from src.collector import collect_missing_odds
+    collect_missing_odds(limit=args.limit)
+
+
+def cmd_collect_racelist(args):
+    from src.collector import collect_missing_racelist
+    collect_missing_racelist(
+        limit=args.limit,
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
+
+
 def cmd_collect(args):
     if args.date:
         from src.collector import collect_date
@@ -101,6 +120,19 @@ def main():
     # db-stats
     subparsers.add_parser("db-stats", help="DB統計表示")
 
+    # build-racer-master
+    subparsers.add_parser("build-racer-master", help="racer_masterをrace_resultsから再構築")
+
+    # collect-odds
+    p_co = subparsers.add_parser("collect-odds", help="race_odds未収集レースの3連単確定オッズを後追い取得")
+    p_co.add_argument("--limit", type=int, help="処理する最大レース数")
+
+    # collect-racelist
+    p_cr = subparsers.add_parser("collect-racelist", help="出走表からモーター/ボート番号・選手ランク・機力指標を後追い取得")
+    p_cr.add_argument("--limit", type=int, help="処理する最大レース数")
+    p_cr.add_argument("--start-date", help="対象下限 YYYY-MM-DD (inclusive)")
+    p_cr.add_argument("--end-date",   help="対象上限 YYYY-MM-DD (inclusive)")
+
     # collect
     p_collect = subparsers.add_parser("collect", help="レースデータ収集")
     p_collect.add_argument("--date", help="日付 (YYYYMMDD)")
@@ -122,6 +154,12 @@ def main():
         cmd_init_db(args)
     elif args.command == "db-stats":
         cmd_db_stats(args)
+    elif args.command == "build-racer-master":
+        cmd_build_racer_master(args)
+    elif args.command == "collect-odds":
+        cmd_collect_odds(args)
+    elif args.command == "collect-racelist":
+        cmd_collect_racelist(args)
     elif args.command == "collect":
         cmd_collect(args)
     elif args.command == "analyze":

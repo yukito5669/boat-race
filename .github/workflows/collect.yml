@@ -76,6 +76,28 @@ jobs:
           echo "実行: python main.py $ARGS"
           python main.py $ARGS
 
+      - name: Backfill missing odds (3連単確定オッズ)
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        # 当日分のレースと、過去の未収集分（BOATRACE公式が約25日保持）をまとめてキャッチアップ。
+        # タイムアウト対策で --limit を指定。
+        run: python main.py collect-odds --limit 500
+
+      - name: Backfill missing racelist (モーター/ボート番号・選手ランク・機力指標)
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        # 出走表ページから racer_rank / motor_no / motor_top2_rate / boat_no / boat_top2_rate を取得。
+        # 過去レースの racelist は長期保持されるので、計算予算内で取れるだけ取る。
+        run: python main.py collect-racelist --limit 500
+
+      - name: Rebuild racer_master from race_results
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: python main.py build-racer-master
+
       - name: Show DB stats
         env:
           TURSO_URL:   ${{ secrets.TURSO_URL }}

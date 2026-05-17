@@ -164,83 +164,137 @@ def get_popularity_roi(bet_type: str = "単勝") -> str:
 
 def get_odds_pattern_analysis(grade: str = "All") -> str:
     """
-    オッズパターン分類分析。
-    1号艇オッズでレース構造を「断然/やや優勢/2強/混戦」に分類し、
-    各パターンでの枠番別勝率・ROIを返す。
-    （horse-raceの核心手法を競艇に移植）
+    オッズパターン分類分析（仮説U-001）。
+
+    3連単の確定オッズから各レースの「1号艇本命度」を算出し、
+    レース構造を「断然/優勢/拮抗/混戦」の4パターンに分類。
+    各パターンで 1号艇勝率・枠番別勝率・3連単1点買い（本命）の的中率/ROI を返す。
+
+    指標:
+      favorite_odds = min(1-X-Y の3連単オッズ) … 1号艇本命のオッズ
+      counter_odds  = min(非1始まりの3連単オッズ) … 2番手本命のオッズ
+      dominance     = counter_odds / favorite_odds … 1号艇相対優位度
 
     Parameters
     ----------
     grade : "SG" | "G1" | "G2" | "G3" | "一般" | "All"
     """
-    # race_odds から1号艇の単勝オッズを取得
     odds_df = query_df("""
         SELECT race_code, combination, odds
         FROM race_odds
-        WHERE bet_type = '単勝'
+        WHERE bet_type = '3連単'
     """)
-
     if odds_df.empty:
         return json.dumps({
-            "error": "オッズデータなし。先にオッズを収集してください。"
+            "error": "3連単オッズデータなし。先に `python main.py collect-odds` を実行してください。"
         }, ensure_ascii=False)
 
-    merged = _get_merged()
-    if merged.empty:
+    odds_df["is_lane1_first"] = odds_df["combination"].str.startswith("1-")
+
+    # レース別に本命/対抗のオッズを算出
+    agg_rows = []
+    for race_code, g in odds_df.groupby("race_code"):
+        fav = g[g["is_lane1_first"]]["odds"].min() if g["is_lane1_first"].any() else None
+        ctr = g[~g["is_lane1_first"]]["odds"].min() if (~g["is_lane1_first"]).any() else None
+        if fav is None or ctr is None:
+            continue
+        fav_combo = g[g["is_lane1_first"]].nsmallest(1, "odds")["combination"].iloc[0]
+        agg_rows.append({
+            "race_code": race_code,
+            "favorite_odds": fav,
+            "counter_odds": ctr,
+            "dominance": ctr / fav,
+            "favorite_combo": fav_combo,
+        })
+    if not agg_rows:
+        return json.dumps({"error": "オッズ集計に失敗"}, ensure_ascii=False)
+
+    race_odds_summary = pd.DataFrame(agg_rows)
+
+    # レース結果を結合
+    info = query_df("SELECT race_code, race_grade, stadium_code, stadium_name FROM race_information")
+    results = query_df("SELECT race_code, lane, finishing_order FROM race_results")
+    if info.empty or results.empty:
         return json.dumps({"error": "レースデータなし"}, ensure_ascii=False)
 
-    merged = _filter(merged, grade)
+    payouts = query_df("SELECT race_code, combination, payout FROM payout_results WHERE bet_type = '3連単'")
+    # 着順1-2-3の組番を作成
+    winner_by_race = (
+        results[results["finishing_order"].between(1, 3)]
+        .sort_values(["race_code", "finishing_order"])
+        .groupby("race_code")["lane"]
+        .apply(lambda s: "-".join(str(int(x)) for x in s))
+        .rename("winning_combo")
+        .reset_index()
+    )
 
-    # 1号艇オッズを結合
-    lane1_odds = odds_df[odds_df["combination"] == "1"].rename(columns={"odds": "lane1_odds"})
-    merged = merged.merge(lane1_odds[["race_code", "lane1_odds"]], on="race_code", how="inner")
-
+    merged = (
+        race_odds_summary
+        .merge(info, on="race_code", how="left")
+        .merge(winner_by_race, on="race_code", how="left")
+        .merge(payouts.rename(columns={"combination": "winning_combo", "payout": "winning_payout"}),
+               on=["race_code", "winning_combo"], how="left")
+    )
+    if grade != "All":
+        merged = merged[merged["race_grade"] == grade]
     if merged.empty:
-        return json.dumps({"error": "オッズとレース結果の紐付けデータなし"}, ensure_ascii=False)
+        return json.dumps({"error": f"グレード '{grade}' のデータなし"}, ensure_ascii=False)
 
-    # パターン分類
-    def classify(odds):
-        if odds <= 1.5:
+    # 1号艇1着フラグ
+    merged["lane1_won"] = merged["winning_combo"].astype(str).str.startswith("1-")
+    merged["favorite_hit"] = merged["favorite_combo"] == merged["winning_combo"]
+
+    def classify(fav):
+        if fav <= 3.5:
             return "A:断然"
-        elif odds <= 2.5:
-            return "B:やや優勢"
-        elif odds <= 4.0:
+        elif fav <= 6.0:
+            return "B:優勢"
+        elif fav <= 10.0:
             return "C:拮抗"
         else:
             return "D:混戦"
+    merged["pattern"] = merged["favorite_odds"].apply(classify)
 
-    merged["pattern"] = merged["lane1_odds"].apply(classify)
+    # 各枠の着順（パターン別に平均勝率を出すため）
+    lane_results = (
+        results.merge(merged[["race_code", "pattern"]], on="race_code", how="inner")
+    )
 
-    results = []
-    for pattern, group in merged.groupby("pattern"):
-        race_codes = group["race_code"].unique()
-        n_races = len(race_codes)
+    patterns_out = []
+    for p, g in merged.groupby("pattern"):
+        n = len(g)
+        lane1_win_rate = round(g["lane1_won"].mean() * 100, 1)
+        fav_hit_rate = round(g["favorite_hit"].mean() * 100, 2)
+        # 本命に各レース100円賭けた時のROI
+        total_bet = n * 100
+        total_return = g.loc[g["favorite_hit"], "winning_payout"].fillna(0).sum()
+        roi = round(total_return / total_bet * 100, 1) if total_bet else 0
 
-        # 1号艇の成績
-        lane1 = group[group["lane"] == 1]
-        lane1_wins = len(lane1[lane1["finishing_order"] == 1])
-        lane1_win_rate = round(lane1_wins / len(lane1) * 100, 1) if len(lane1) > 0 else 0
-
-        # 各枠の勝率
-        lane_wins = {}
+        # 各枠別勝率
+        lp = lane_results[lane_results["pattern"] == p]
+        lane_win_rates = {}
         for lane in range(1, 7):
-            l = group[group["lane"] == lane]
-            w = len(l[l["finishing_order"] == 1])
-            lane_wins[lane] = round(w / len(l) * 100, 1) if len(l) > 0 else 0
+            sub = lp[lp["lane"] == lane]
+            w = (sub["finishing_order"] == 1).sum()
+            lane_win_rates[lane] = round(w / len(sub) * 100, 1) if len(sub) else 0
 
-        results.append({
-            "pattern": pattern,
-            "races": n_races,
-            "avg_lane1_odds": round(group.drop_duplicates("race_code")["lane1_odds"].mean(), 2),
+        patterns_out.append({
+            "pattern": p,
+            "races": n,
+            "avg_favorite_odds": round(g["favorite_odds"].mean(), 2),
+            "avg_dominance": round(g["dominance"].mean(), 2),
             "lane1_win_rate": lane1_win_rate,
-            "lane_win_rates": lane_wins,
+            "favorite_hit_rate": fav_hit_rate,
+            "favorite_roi": roi,
+            "lane_win_rates": lane_win_rates,
         })
+    patterns_out.sort(key=lambda x: x["pattern"])
 
-    results.sort(key=lambda x: x["pattern"])
     return json.dumps({
         "grade": grade,
-        "total_races": merged["race_code"].nunique(),
-        "patterns": results,
+        "total_races": len(merged),
+        "indicator": "3連単 min(1-X-Y) を1号艇本命オッズとしてレース構造を分類",
+        "patterns": patterns_out,
     }, ensure_ascii=False)
 
 

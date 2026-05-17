@@ -18,8 +18,11 @@ from src.database import (
     STADIUM_MAP,
     insert_payout_results,
     insert_race_information,
+    insert_race_odds,
     insert_race_results,
     race_exists,
+    race_odds_exists,
+    update_racelist_for_race,
 )
 
 BASE_URL = "https://www.boatrace.jp/owpc/pc/race"
@@ -233,62 +236,155 @@ def _parse_race_name(soup: BeautifulSoup) -> str:
 
 # ── 出走表ページ解析（選手ランク・モーター・ボート） ─────────────────────────
 
-def _fetch_racelist_info(hd: str, jcd: str, rno: int) -> dict[str, dict]:
-    """出走表ページから選手ランク・モーター・ボート番号を取得
+_FW_DIGITS = str.maketrans("１２３４５６", "123456")
 
-    Returns: {racer_id: {"racer_rank": "A1", "motor_no": 38, "boat_no": 15}}
+
+def _parse_racelist(soup: BeautifulSoup) -> dict[int, dict]:
+    """出走表ページから lane → 各種情報 のdictを返す。
+
+    Returns: {lane: {
+        "racer_id": str, "racer_rank": "A1"|...,
+        "motor_no": int, "motor_top2_rate": float, "motor_top3_rate": float,
+        "boat_no": int,  "boat_top2_rate": float,  "boat_top3_rate": float,
+    }}
     """
+    out: dict[int, dict] = {}
+    tables = soup.select("table")
+    if len(tables) < 2:
+        return out
+
+    # 主要テーブルを特定: tbody が 6 個ある最初のテーブル（6艇分）
+    target = None
+    for t in tables:
+        if len(t.find_all("tbody")) == 6:
+            target = t
+            break
+    if target is None:
+        return out
+
+    for tbody in target.find_all("tbody"):
+        rows = tbody.find_all("tr")
+        if not rows:
+            continue
+        cells = rows[0].find_all("td")
+        if len(cells) < 8:
+            continue
+
+        # 枠番（全角）
+        lane_text = cells[0].get_text(strip=True).translate(_FW_DIGITS)
+        try:
+            lane = int(lane_text)
+        except ValueError:
+            continue
+        if lane < 1 or lane > 6:
+            continue
+
+        # 選手ID + ランク
+        racer_block = cells[2].get_text(" ", strip=True)
+        m = re.search(r"(\d{4})\s*/\s*(A1|A2|B1|B2)", racer_block)
+        racer_id = m.group(1) if m else None
+        racer_rank = m.group(2) if m else None
+
+        # モーター: '16 48.60 65.42'
+        motor_parts = cells[6].get_text(" ", strip=True).split()
+        motor_no = int(motor_parts[0]) if len(motor_parts) >= 1 and motor_parts[0].isdigit() else None
+        motor_t2 = float(motor_parts[1]) if len(motor_parts) >= 2 else None
+        motor_t3 = float(motor_parts[2]) if len(motor_parts) >= 3 else None
+
+        # ボート: '37 23.08 46.15'
+        boat_parts = cells[7].get_text(" ", strip=True).split()
+        boat_no = int(boat_parts[0]) if len(boat_parts) >= 1 and boat_parts[0].isdigit() else None
+        boat_t2 = float(boat_parts[1]) if len(boat_parts) >= 2 else None
+        boat_t3 = float(boat_parts[2]) if len(boat_parts) >= 3 else None
+
+        out[lane] = {
+            "racer_id": racer_id,
+            "racer_rank": racer_rank,
+            "motor_no": motor_no,
+            "motor_top2_rate": motor_t2,
+            "motor_top3_rate": motor_t3,
+            "boat_no": boat_no,
+            "boat_top2_rate": boat_t2,
+            "boat_top3_rate": boat_t3,
+        }
+
+    return out
+
+
+def _fetch_racelist_info(hd: str, jcd: str, rno: int) -> dict[int, dict]:
+    """出走表ページを取得して `_parse_racelist` の結果を返す"""
     url = f"{BASE_URL}/racelist?rno={rno}&jcd={jcd}&hd={hd}"
     soup = _fetch(url)
     if not soup:
         return {}
+    return _parse_racelist(soup)
 
-    info = {}
-    # 出走表の各選手行
-    tbody_list = soup.select("div.table1 tbody.is-fs12")
-    if not tbody_list:
-        tbody_list = soup.select("table.is-w748 tbody, table.is-w1200 tbody")
 
-    for tbody in tbody_list:
-        tds = tbody.select("td")
-        if len(tds) < 3:
-            continue
+# ── 3連単オッズページ解析 ───────────────────────────────────────────────────
 
-        # 選手ID / ランク を探す
-        for td in tds:
-            text = td.get_text(strip=True)
-            # "5316/B1" パターン
-            m = re.search(r"(\d{4})\s*/\s*(A1|A2|B1|B2)", text)
-            if m:
-                racer_id = m.group(1)
-                racer_rank = m.group(2)
-                info[racer_id] = {"racer_rank": racer_rank, "motor_no": None, "boat_no": None}
-                break
+def _build_3t_combinations() -> list[str]:
+    """3連単120通りを、BOATRACE公式のodds3tテーブル DOM出現順に返す。
 
-    # モーター・ボート番号はテーブル構造に依存するため、別途パース
-    # 出走表テーブルの全行を走査
-    all_tables = soup.select("div.table1 table")
-    for table in all_tables:
-        rows = table.select("tbody")
-        for row in rows:
-            all_tds = row.select("td")
-            full_text = " ".join(td.get_text(strip=True) for td in all_tds)
+    DOM順:
+      5ブロック(2着バリアント) × 4行(3着バリアント) × 6列(1着=1..6)
+    各列cにおいて 2着 = sorted([1..6]\\{c})[block],
+    3着 = sorted([1..6]\\{c,s})[row_in_block]
+    """
+    combos = []
+    for block in range(5):
+        for row_in_block in range(4):
+            for col in range(6):
+                first = col + 1
+                second_choices = [x for x in range(1, 7) if x != first]
+                second = second_choices[block]
+                third_choices = [x for x in range(1, 7) if x != first and x != second]
+                third = third_choices[row_in_block]
+                combos.append(f"{first}-{second}-{third}")
+    return combos
 
-            # 選手IDを特定
-            id_match = re.search(r"(\d{4})\s*/\s*(A1|A2|B1|B2)", full_text)
-            if not id_match:
-                continue
-            racer_id = id_match.group(1)
-            if racer_id not in info:
-                info[racer_id] = {"racer_rank": id_match.group(2), "motor_no": None, "boat_no": None}
 
-            # モーター・ボート番号をテキストから抽出
-            for td in all_tds:
-                td_text = td.get_text(strip=True)
-                # モーター番号の候補（2-3桁の数字で、他のフィールドでない）
-                # 出走表の構造に基づいて位置で判別する方がよい
+_3T_COMBINATIONS = _build_3t_combinations()
 
-    return info
+
+def _parse_3t_odds(soup: BeautifulSoup) -> list[dict]:
+    """3連単オッズテーブルから120通りの (combination, odds) を抽出"""
+    cells = soup.select("td.oddsPoint")
+    if len(cells) != 120:
+        # レース未実施・中止・データ欠損など
+        return []
+
+    odds = []
+    for combo, cell in zip(_3T_COMBINATIONS, cells):
+        txt = cell.get_text(strip=True)
+        try:
+            value = float(txt)
+        except ValueError:
+            continue  # 「欠場」等は数値変換不可でスキップ
+        odds.append({
+            "bet_type": "3連単",
+            "combination": combo,
+            "odds": value,
+        })
+    return odds
+
+
+def collect_race_odds(hd: str, jcd: str, rno: int, force: bool = False) -> bool:
+    """1レースの3連単確定オッズを収集。race_oddsに既存データがあればスキップ。"""
+    race_code = f"{hd}_{jcd}_{rno:02d}"
+    if not force and race_odds_exists(race_code):
+        return False
+
+    url = f"{BASE_URL}/odds3t?rno={rno}&jcd={jcd}&hd={hd}"
+    soup = _fetch(url)
+    if not soup:
+        return False
+
+    odds = _parse_3t_odds(soup)
+    if not odds:
+        return False
+
+    insert_race_odds(race_code, odds)
+    return True
 
 
 # ── 公開API: 1レース収集 ───────────────────────────────────────────────────
@@ -304,12 +400,19 @@ def _save_race_from_soup(
         return False
 
     st_map = _parse_start_info(soup)
+    racelist = _fetch_racelist_info(hd, jcd, rno)  # lane -> {rank, motor_no, ...}
     for r in results:
-        r["start_timing"] = st_map.get(r["lane"])
-        r["course"] = r["lane"]
-        r["racer_rank"] = None
-        r["motor_no"] = None
-        r["boat_no"] = None
+        lane = r["lane"]
+        r["start_timing"] = st_map.get(lane)
+        r["course"] = lane
+        rl = racelist.get(lane, {})
+        r["racer_rank"] = rl.get("racer_rank")
+        r["motor_no"] = rl.get("motor_no")
+        r["motor_top2_rate"] = rl.get("motor_top2_rate")
+        r["motor_top3_rate"] = rl.get("motor_top3_rate")
+        r["boat_no"] = rl.get("boat_no")
+        r["boat_top2_rate"] = rl.get("boat_top2_rate")
+        r["boat_top3_rate"] = rl.get("boat_top3_rate")
 
     stadium_name = STADIUM_MAP.get(jcd, "不明")
     race_date = f"{hd[:4]}-{hd[4:6]}-{hd[6:8]}"
@@ -332,7 +435,11 @@ def _save_race_from_soup(
     if payouts:
         insert_payout_results(race_code, payouts)
 
-    print(f"  [OK] {race_code} ({stadium_name} {rno}R): {len(results)}艇, {len(payouts)}件払戻")
+    # 3連単確定オッズを追加取得（結果が保存できたレースのみ）
+    odds_ok = collect_race_odds(hd, jcd, rno)
+    odds_note = "+オッズ" if odds_ok else ""
+
+    print(f"  [OK] {race_code} ({stadium_name} {rno}R): {len(results)}艇, {len(payouts)}件払戻{odds_note}")
     return True
 
 
@@ -399,6 +506,187 @@ def collect_date(hd: str, stadium_codes: list[str] | None = None, force: bool = 
 
     print(f"\n[完了] {hd}: {total}レース収集")
     return total
+
+
+# ── 公開API: 既存レースのオッズのみ後追い収集 ───────────────────────────────
+
+def collect_missing_odds(limit: int | None = None) -> tuple[int, int]:
+    """race_oddsが未収集のレースに対して3連単オッズを取得する。
+
+    BOATRACE公式はオッズを約20-30日分しか保持しないため、期限切れレースもあり得る。
+    404・データなしはスキップして継続する。
+
+    Args:
+        limit: 処理する最大レース数（None=全件）
+
+    Returns: (成功数, スキップ数)
+    """
+    from src.database import query_df
+
+    df = query_df(
+        """
+        SELECT ri.race_code, ri.race_date, ri.stadium_code, ri.stadium_name, ri.race_number
+        FROM race_information ri
+        LEFT JOIN (
+            SELECT DISTINCT race_code FROM race_odds
+        ) ro ON ro.race_code = ri.race_code
+        WHERE ro.race_code IS NULL
+        ORDER BY ri.race_date DESC, ri.stadium_code, ri.race_number
+        """
+    )
+    if df.empty:
+        print("[オッズ後追い] 対象レースなし")
+        return 0, 0
+
+    if limit:
+        df = df.head(limit)
+
+    total = len(df)
+    success, skipped = 0, 0
+    print(f"[オッズ後追い] 対象: {total} レース")
+
+    current_date = None
+    for idx, row in df.iterrows():
+        hd = row["race_date"].replace("-", "")
+        jcd = row["stadium_code"]
+        rno = int(row["race_number"])
+
+        if row["race_date"] != current_date:
+            current_date = row["race_date"]
+            print(f"\n[{current_date}]", flush=True)
+
+        # 一過性のネットワーク/DNS/Connection reset 等を fetch+書き込みの双方で最大3回リトライ。
+        # collect_race_odds は内部で fetch と insert_race_odds (batch) の両方を行うため、関数全体を覆う。
+        ok = False
+        last_exc = None
+        for attempt in range(3):
+            try:
+                ok = collect_race_odds(hd, jcd, rno)
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                wait = 5 * (attempt + 1)
+                print(f"  [retry {attempt+1}/3] {row['race_code']}: {type(e).__name__} -> {wait}s sleep", flush=True)
+                time.sleep(wait)
+
+        if last_exc is not None:
+            skipped += 1
+            print(f"  [error] {row['race_code']} ({row['stadium_name']} {rno}R): {type(last_exc).__name__}", flush=True)
+            continue
+
+        if ok:
+            success += 1
+            print(f"  [OK]   {row['race_code']} ({row['stadium_name']} {rno}R)", flush=True)
+        else:
+            skipped += 1
+            print(f"  [skip] {row['race_code']} ({row['stadium_name']} {rno}R): オッズなし/期限切れ", flush=True)
+
+    print(f"\n[完了] 成功: {success}, スキップ: {skipped}", flush=True)
+    return success, skipped
+
+
+# ── 公開API: 既存レースのracelist情報を後追い更新 ───────────────────────────
+
+def collect_missing_racelist(
+    limit: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[int, int]:
+    """racer_rank または motor_no が NULL のレースに対して racelist 情報を後追い取得しUPDATE。
+
+    Args:
+        limit: 処理する最大レース数（None=全件）
+        start_date: 対象日付の下限 (YYYY-MM-DD inclusive)
+        end_date:   対象日付の上限 (YYYY-MM-DD inclusive)
+
+    Returns: (成功数, スキップ数)
+    """
+    from src.database import query_df
+
+    where_parts = [
+        """race_code IN (
+            SELECT race_code FROM race_results
+            WHERE racer_rank IS NULL OR motor_no IS NULL
+            GROUP BY race_code
+        )"""
+    ]
+    params: list = []
+    if start_date:
+        where_parts.append("race_date >= ?")
+        params.append(start_date)
+    if end_date:
+        where_parts.append("race_date <= ?")
+        params.append(end_date)
+    where_clause = " AND ".join(where_parts)
+
+    df = query_df(
+        f"""
+        SELECT race_code, race_date, stadium_code, stadium_name, race_number
+        FROM race_information
+        WHERE {where_clause}
+        ORDER BY race_date DESC, stadium_code, race_number
+        """,
+        params,
+    )
+    if df.empty:
+        print("[racelist後追い] 対象レースなし", flush=True)
+        return 0, 0
+
+    if limit:
+        df = df.head(limit)
+
+    total = len(df)
+    success, skipped = 0, 0
+    print(f"[racelist後追い] 対象: {total} レース", flush=True)
+
+    current_date = None
+    for _, row in df.iterrows():
+        hd = row["race_date"].replace("-", "")
+        jcd = row["stadium_code"]
+        rno = int(row["race_number"])
+        race_code = row["race_code"]
+
+        if row["race_date"] != current_date:
+            current_date = row["race_date"]
+            print(f"\n[{current_date}]", flush=True)
+
+        # ネットワーク/DNS/Connection reset 等の一過性エラーは fetch / DB-update の双方で最大3回リトライ。
+        # 全失敗ならそのレースだけスキップして次へ進む（全体停止を防ぐ）。
+        def _do_with_retry(label: str, fn):
+            last = None
+            for attempt in range(3):
+                try:
+                    return fn(), None
+                except Exception as e:
+                    last = e
+                    wait = 5 * (attempt + 1)
+                    print(f"  [retry {attempt+1}/3] {race_code} {label}: {type(e).__name__} -> {wait}s sleep", flush=True)
+                    time.sleep(wait)
+            return None, last
+
+        info, fetch_exc = _do_with_retry("fetch", lambda: _fetch_racelist_info(hd, jcd, rno))
+        if fetch_exc is not None or not info:
+            skipped += 1
+            label = type(fetch_exc).__name__ if fetch_exc else "no-data"
+            print(f"  [skip] {race_code} ({row['stadium_name']} {rno}R): {label}", flush=True)
+            continue
+
+        n, upd_exc = _do_with_retry("update", lambda: update_racelist_for_race(race_code, info))
+        if upd_exc is not None:
+            skipped += 1
+            print(f"  [error] {race_code} ({row['stadium_name']} {rno}R): UPDATE {type(upd_exc).__name__}", flush=True)
+            continue
+
+        if n and n > 0:
+            success += 1
+            print(f"  [OK]   {race_code} ({row['stadium_name']} {rno}R): {n} 艇更新", flush=True)
+        else:
+            skipped += 1
+            print(f"  [skip] {race_code} ({row['stadium_name']} {rno}R): UPDATE 0行", flush=True)
+
+    print(f"\n[完了] 成功: {success}, スキップ: {skipped}", flush=True)
+    return success, skipped
 
 
 # ── 公開API: 期間収集 ──────────────────────────────────────────────────────

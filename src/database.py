@@ -58,20 +58,29 @@ _SCHEMA_STATEMENTS = [
     # レース着順結果
     """
     CREATE TABLE IF NOT EXISTS race_results (
-        id              INTEGER PRIMARY KEY,
-        race_code       TEXT NOT NULL,
+        id               INTEGER PRIMARY KEY,
+        race_code        TEXT NOT NULL,
         finishing_order  INTEGER,
-        lane            INTEGER,
-        racer_id        TEXT,
-        racer_name      TEXT,
-        racer_rank      TEXT,
-        motor_no        INTEGER,
-        boat_no         INTEGER,
-        race_time       TEXT,
-        start_timing    REAL,
-        course          INTEGER
+        lane             INTEGER,
+        racer_id         TEXT,
+        racer_name       TEXT,
+        racer_rank       TEXT,
+        motor_no         INTEGER,
+        motor_top2_rate  REAL,
+        motor_top3_rate  REAL,
+        boat_no          INTEGER,
+        boat_top2_rate   REAL,
+        boat_top3_rate   REAL,
+        race_time        TEXT,
+        start_timing     REAL,
+        course           INTEGER
     )
     """,
+    # 既存テーブルへのカラム追加（IF NOT EXISTS未対応のSQLite/libSQLでもエラー無視）
+    "ALTER TABLE race_results ADD COLUMN motor_top2_rate REAL",
+    "ALTER TABLE race_results ADD COLUMN motor_top3_rate REAL",
+    "ALTER TABLE race_results ADD COLUMN boat_top2_rate  REAL",
+    "ALTER TABLE race_results ADD COLUMN boat_top3_rate  REAL",
     # 払戻金
     """
     CREATE TABLE IF NOT EXISTS payout_results (
@@ -161,11 +170,21 @@ _SCHEMA_STATEMENTS = [
 
 
 def init_db():
-    """全テーブル・インデックスを作成"""
+    """全テーブル・インデックスを作成。
+
+    ALTER TABLE ADD COLUMN は既存カラムがあるとエラーになるが、
+    libSQLは IF NOT EXISTS をサポートしないため try/except で吸収する。
+    """
     client = _get_client()
     try:
         for stmt in _SCHEMA_STATEMENTS:
-            client.execute(stmt)
+            try:
+                client.execute(stmt)
+            except Exception as e:
+                msg = str(e).lower()
+                if "duplicate column" in msg or "already exists" in msg:
+                    continue
+                raise
         print(f"[DB] スキーマ初期化完了（{len(_SCHEMA_STATEMENTS)}ステートメント実行）")
     finally:
         client.close()
@@ -211,18 +230,65 @@ def insert_race_results(race_code: str, results: list[dict]):
                 """
                 INSERT INTO race_results
                     (race_code, finishing_order, lane, racer_id, racer_name, racer_rank,
-                     motor_no, boat_no, race_time, start_timing, course)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     motor_no, motor_top2_rate, motor_top3_rate,
+                     boat_no, boat_top2_rate, boat_top3_rate,
+                     race_time, start_timing, course)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     race_code, r.get("finishing_order"), r.get("lane"),
                     r.get("racer_id"), r.get("racer_name"), r.get("racer_rank"),
-                    r.get("motor_no"), r.get("boat_no"), r.get("race_time"),
-                    r.get("start_timing"), r.get("course"),
+                    r.get("motor_no"), r.get("motor_top2_rate"), r.get("motor_top3_rate"),
+                    r.get("boat_no"),  r.get("boat_top2_rate"),  r.get("boat_top3_rate"),
+                    r.get("race_time"), r.get("start_timing"), r.get("course"),
                 ],
             )
     finally:
         client.close()
+
+
+def update_racelist_for_race(race_code: str, lane_data: dict[int, dict]) -> int:
+    """既存のrace_resultsに racelist情報（rank/motor/boat と機力率）をUPDATE。
+
+    Args:
+        race_code: 対象レースコード
+        lane_data: {lane: {racer_rank, motor_no, motor_top2_rate, motor_top3_rate,
+                           boat_no, boat_top2_rate, boat_top3_rate}}
+
+    Returns: UPDATEした行数
+    """
+    if not lane_data:
+        return 0
+    client = _get_client()
+    n = 0
+    try:
+        stmts = []
+        for lane, info in lane_data.items():
+            stmts.append((
+                """
+                UPDATE race_results
+                SET racer_rank      = COALESCE(?, racer_rank),
+                    motor_no        = COALESCE(?, motor_no),
+                    motor_top2_rate = COALESCE(?, motor_top2_rate),
+                    motor_top3_rate = COALESCE(?, motor_top3_rate),
+                    boat_no         = COALESCE(?, boat_no),
+                    boat_top2_rate  = COALESCE(?, boat_top2_rate),
+                    boat_top3_rate  = COALESCE(?, boat_top3_rate)
+                WHERE race_code = ? AND lane = ?
+                """,
+                [
+                    info.get("racer_rank"),
+                    info.get("motor_no"), info.get("motor_top2_rate"), info.get("motor_top3_rate"),
+                    info.get("boat_no"),  info.get("boat_top2_rate"),  info.get("boat_top3_rate"),
+                    race_code, lane,
+                ],
+            ))
+        if stmts:
+            client.batch(stmts)
+            n = len(stmts)
+    finally:
+        client.close()
+    return n
 
 
 # ── CRUD: payout_results ────────────────────────────────────────────────────
@@ -245,12 +311,24 @@ def insert_payout_results(race_code: str, payouts: list[dict]):
 
 # ── CRUD: race_odds ─────────────────────────────────────────────────────────
 
+def race_odds_exists(race_code: str) -> bool:
+    client = _get_client()
+    try:
+        rs = client.execute("SELECT 1 FROM race_odds WHERE race_code = ? LIMIT 1", [race_code])
+        return len(rs.rows) > 0
+    finally:
+        client.close()
+
+
 def insert_race_odds(race_code: str, odds_list: list[dict]):
+    """1レース分のオッズをバッチ送信（1トランザクションでまとめて投入）。"""
+    if not odds_list:
+        return
     client = _get_client()
     try:
         now = datetime.now(timezone.utc).isoformat()
-        for o in odds_list:
-            client.execute(
+        stmts = [
+            (
                 """
                 INSERT INTO race_odds
                     (race_code, bet_type, combination, odds, collected_at)
@@ -258,6 +336,9 @@ def insert_race_odds(race_code: str, odds_list: list[dict]):
                 """,
                 [race_code, o["bet_type"], o["combination"], o["odds"], now],
             )
+            for o in odds_list
+        ]
+        client.batch(stmts)
     finally:
         client.close()
 
@@ -299,6 +380,86 @@ def query_df(sql: str, params: list | None = None) -> pd.DataFrame:
         return pd.DataFrame([list(row) for row in rs.rows], columns=columns)
     finally:
         client.close()
+
+
+def build_racer_master() -> int:
+    """race_resultsから選手別に集計し、racer_masterをupsertする。
+
+    rank/branchは別ソース（出走表）からの取得が必要なためNULL保留。
+    finishing_order=99（転覆・失格等）はwin/top2/top3から除外するが、total_racesには含める。
+
+    Returns: upsertした選手数
+    """
+    df = query_df(
+        """
+        SELECT racer_id, racer_name, finishing_order, start_timing
+        FROM race_results
+        WHERE racer_id IS NOT NULL AND racer_id != ''
+        """
+    )
+    if df.empty:
+        print("[racer_master] race_resultsにデータなし")
+        return 0
+
+    # 最新の選手名を採用（同じracer_idで表記揺れがあった場合の保険）
+    latest_name = (
+        df.dropna(subset=["racer_name"])
+        .groupby("racer_id")["racer_name"]
+        .agg(lambda s: s.iloc[-1])
+    )
+
+    grouped = df.groupby("racer_id")
+    now = datetime.now(timezone.utc).isoformat()
+
+    client = _get_client()
+    count = 0
+    try:
+        for racer_id, g in grouped:
+            total = len(g)
+            valid = g[g["finishing_order"] < 99]
+            wins = int((valid["finishing_order"] == 1).sum())
+            top2 = int((valid["finishing_order"] <= 2).sum())
+            top3 = int((valid["finishing_order"] <= 3).sum())
+            avg_st = g["start_timing"].dropna().mean()
+
+            client.execute(
+                """
+                INSERT INTO racer_master
+                    (racer_id, racer_name, rank, branch, total_races, wins, top2, top3,
+                     win_rate, top2_rate, top3_rate, avg_start_timing, updated_at)
+                VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(racer_id) DO UPDATE SET
+                    racer_name       = excluded.racer_name,
+                    total_races      = excluded.total_races,
+                    wins             = excluded.wins,
+                    top2             = excluded.top2,
+                    top3             = excluded.top3,
+                    win_rate         = excluded.win_rate,
+                    top2_rate        = excluded.top2_rate,
+                    top3_rate        = excluded.top3_rate,
+                    avg_start_timing = excluded.avg_start_timing,
+                    updated_at       = excluded.updated_at
+                """,
+                [
+                    racer_id,
+                    latest_name.get(racer_id, ""),
+                    total,
+                    wins,
+                    top2,
+                    top3,
+                    round(wins / total * 100, 2) if total else 0.0,
+                    round(top2 / total * 100, 2) if total else 0.0,
+                    round(top3 / total * 100, 2) if total else 0.0,
+                    round(float(avg_st), 4) if pd.notna(avg_st) else None,
+                    now,
+                ],
+            )
+            count += 1
+    finally:
+        client.close()
+
+    print(f"[racer_master] {count} 選手をupsertしました")
+    return count
 
 
 def get_db_stats() -> dict:
