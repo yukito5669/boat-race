@@ -223,26 +223,30 @@ def insert_race_information(data: dict):
 # ── CRUD: race_results ──────────────────────────────────────────────────────
 
 def insert_race_results(race_code: str, results: list[dict]):
+    """6艇分をまとめて batch でINSERT（個別execute だと往復で数秒かかるため）"""
+    if not results:
+        return
     client = _get_client()
     try:
-        for r in results:
-            client.execute(
-                """
-                INSERT INTO race_results
-                    (race_code, finishing_order, lane, racer_id, racer_name, racer_rank,
-                     motor_no, motor_top2_rate, motor_top3_rate,
-                     boat_no, boat_top2_rate, boat_top3_rate,
-                     race_time, start_timing, course)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    race_code, r.get("finishing_order"), r.get("lane"),
-                    r.get("racer_id"), r.get("racer_name"), r.get("racer_rank"),
-                    r.get("motor_no"), r.get("motor_top2_rate"), r.get("motor_top3_rate"),
-                    r.get("boat_no"),  r.get("boat_top2_rate"),  r.get("boat_top3_rate"),
-                    r.get("race_time"), r.get("start_timing"), r.get("course"),
-                ],
-            )
+        sql = """
+        INSERT INTO race_results
+            (race_code, finishing_order, lane, racer_id, racer_name, racer_rank,
+             motor_no, motor_top2_rate, motor_top3_rate,
+             boat_no, boat_top2_rate, boat_top3_rate,
+             race_time, start_timing, course)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        stmts = [
+            (sql, [
+                race_code, r.get("finishing_order"), r.get("lane"),
+                r.get("racer_id"), r.get("racer_name"), r.get("racer_rank"),
+                r.get("motor_no"), r.get("motor_top2_rate"), r.get("motor_top3_rate"),
+                r.get("boat_no"),  r.get("boat_top2_rate"),  r.get("boat_top3_rate"),
+                r.get("race_time"), r.get("start_timing"), r.get("course"),
+            ])
+            for r in results
+        ]
+        client.batch(stmts)
     finally:
         client.close()
 
@@ -294,17 +298,82 @@ def update_racelist_for_race(race_code: str, lane_data: dict[int, dict]) -> int:
 # ── CRUD: payout_results ────────────────────────────────────────────────────
 
 def insert_payout_results(race_code: str, payouts: list[dict]):
+    """払戻金をまとめて batch でINSERT"""
+    if not payouts:
+        return
     client = _get_client()
     try:
-        for p in payouts:
-            client.execute(
-                """
-                INSERT INTO payout_results
-                    (race_code, bet_type, combination, payout, popularity)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [race_code, p["bet_type"], p["combination"], p["payout"], p.get("popularity")],
-            )
+        sql = """
+        INSERT INTO payout_results
+            (race_code, bet_type, combination, payout, popularity)
+        VALUES (?, ?, ?, ?, ?)
+        """
+        stmts = [
+            (sql, [race_code, p["bet_type"], p["combination"], p["payout"], p.get("popularity")])
+            for p in payouts
+        ]
+        client.batch(stmts)
+    finally:
+        client.close()
+
+
+def save_race_bundle(
+    race_info: dict,
+    results: list[dict],
+    payouts: list[dict],
+):
+    """1レース分のメタ・着順・払戻を **1接続・1バッチ** で保存する高速版。
+
+    バックフィル時に insert_race_information + insert_race_results + insert_payout_results を
+    別々に呼ぶと、Turso接続オープンクローズが3回発生して秒単位の遅延になるためまとめる。
+    """
+    client = _get_client()
+    try:
+        stmts: list[tuple[str, list]] = []
+
+        stmts.append((
+            """
+            INSERT OR IGNORE INTO race_information
+                (race_code, race_date, stadium_code, stadium_name, race_number, race_grade, race_name, year)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                race_info["race_code"], race_info["race_date"], race_info["stadium_code"],
+                race_info["stadium_name"], race_info["race_number"],
+                race_info.get("race_grade", "一般"),
+                race_info.get("race_name", ""), race_info["year"],
+            ],
+        ))
+
+        rr_sql = """
+        INSERT INTO race_results
+            (race_code, finishing_order, lane, racer_id, racer_name, racer_rank,
+             motor_no, motor_top2_rate, motor_top3_rate,
+             boat_no, boat_top2_rate, boat_top3_rate,
+             race_time, start_timing, course)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        for r in results:
+            stmts.append((rr_sql, [
+                race_info["race_code"], r.get("finishing_order"), r.get("lane"),
+                r.get("racer_id"), r.get("racer_name"), r.get("racer_rank"),
+                r.get("motor_no"), r.get("motor_top2_rate"), r.get("motor_top3_rate"),
+                r.get("boat_no"),  r.get("boat_top2_rate"),  r.get("boat_top3_rate"),
+                r.get("race_time"), r.get("start_timing"), r.get("course"),
+            ]))
+
+        pr_sql = """
+        INSERT INTO payout_results
+            (race_code, bet_type, combination, payout, popularity)
+        VALUES (?, ?, ?, ?, ?)
+        """
+        for p in payouts or []:
+            stmts.append((pr_sql, [
+                race_info["race_code"], p["bet_type"], p["combination"],
+                p["payout"], p.get("popularity"),
+            ]))
+
+        client.batch(stmts)
     finally:
         client.close()
 

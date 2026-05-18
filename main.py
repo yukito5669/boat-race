@@ -45,7 +45,11 @@ def cmd_build_racer_master(_args):
 
 def cmd_collect_odds(args):
     from src.collector import collect_missing_odds
-    collect_missing_odds(limit=args.limit)
+    collect_missing_odds(
+        limit=args.limit,
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
 
 
 def cmd_collect_racelist(args):
@@ -126,6 +130,8 @@ def main():
     # collect-odds
     p_co = subparsers.add_parser("collect-odds", help="race_odds未収集レースの3連単確定オッズを後追い取得")
     p_co.add_argument("--limit", type=int, help="処理する最大レース数")
+    p_co.add_argument("--start-date", help="対象下限 YYYY-MM-DD (inclusive)")
+    p_co.add_argument("--end-date",   help="対象上限 YYYY-MM-DD (inclusive)")
 
     # collect-racelist
     p_cr = subparsers.add_parser("collect-racelist", help="出走表からモーター/ボート番号・選手ランク・機力指標を後追い取得")

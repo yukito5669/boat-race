@@ -9,7 +9,11 @@ BOATRACE公式サイト スクレイピングモジュール
 """
 import re
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
+
+# BOATRACE公式は3連単オッズを約50日のみ保持。
+# 当該閾値より古い日付では `odds3t` を fetch しても確実に空なので、無駄な1.5sを省く。
+ODDS_RETENTION_DAYS = 55
 
 import requests
 from bs4 import BeautifulSoup
@@ -22,6 +26,7 @@ from src.database import (
     insert_race_results,
     race_exists,
     race_odds_exists,
+    save_race_bundle,
     update_racelist_for_race,
 )
 
@@ -430,14 +435,18 @@ def _save_race_from_soup(
 
     payouts = _parse_payouts(soup)
 
-    insert_race_information(race_info)
-    insert_race_results(race_code, results)
-    if payouts:
-        insert_payout_results(race_code, payouts)
+    # 1接続でメタ・着順・払戻を一括INSERT（旧:3接続分の往復遅延を削減）
+    save_race_bundle(race_info, results, payouts)
 
-    # 3連単確定オッズを追加取得（結果が保存できたレースのみ）
-    odds_ok = collect_race_odds(hd, jcd, rno)
-    odds_note = "+オッズ" if odds_ok else ""
+    # 3連単確定オッズを追加取得（結果が保存できたレースのみ・保持期間内のみ）
+    odds_note = ""
+    try:
+        race_d = date(int(hd[:4]), int(hd[4:6]), int(hd[6:8]))
+        if (date.today() - race_d).days <= ODDS_RETENTION_DAYS:
+            odds_ok = collect_race_odds(hd, jcd, rno)
+            odds_note = "+オッズ" if odds_ok else ""
+    except Exception:
+        pass
 
     print(f"  [OK] {race_code} ({stadium_name} {rno}R): {len(results)}艇, {len(payouts)}件払戻{odds_note}")
     return True
@@ -510,7 +519,11 @@ def collect_date(hd: str, stadium_codes: list[str] | None = None, force: bool = 
 
 # ── 公開API: 既存レースのオッズのみ後追い収集 ───────────────────────────────
 
-def collect_missing_odds(limit: int | None = None) -> tuple[int, int]:
+def collect_missing_odds(
+    limit: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[int, int]:
     """race_oddsが未収集のレースに対して3連単オッズを取得する。
 
     BOATRACE公式はオッズを約20-30日分しか保持しないため、期限切れレースもあり得る。
@@ -518,21 +531,34 @@ def collect_missing_odds(limit: int | None = None) -> tuple[int, int]:
 
     Args:
         limit: 処理する最大レース数（None=全件）
+        start_date: 対象日付の下限 (YYYY-MM-DD inclusive)
+        end_date:   対象日付の上限 (YYYY-MM-DD inclusive)
 
     Returns: (成功数, スキップ数)
     """
     from src.database import query_df
 
+    where_parts = ["ro.race_code IS NULL"]
+    params: list = []
+    if start_date:
+        where_parts.append("ri.race_date >= ?")
+        params.append(start_date)
+    if end_date:
+        where_parts.append("ri.race_date <= ?")
+        params.append(end_date)
+    where_clause = " AND ".join(where_parts)
+
     df = query_df(
-        """
+        f"""
         SELECT ri.race_code, ri.race_date, ri.stadium_code, ri.stadium_name, ri.race_number
         FROM race_information ri
         LEFT JOIN (
             SELECT DISTINCT race_code FROM race_odds
         ) ro ON ro.race_code = ri.race_code
-        WHERE ro.race_code IS NULL
+        WHERE {where_clause}
         ORDER BY ri.race_date DESC, ri.stadium_code, ri.race_number
-        """
+        """,
+        params,
     )
     if df.empty:
         print("[オッズ後追い] 対象レースなし")
