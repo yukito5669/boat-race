@@ -271,6 +271,40 @@ def insert_race_results(race_code: str, results: list[dict]):
         client.close()
 
 
+def update_race_grade_for_stadium_day(hd: str, jcd: str, grade: str) -> int:
+    """同日同場の全レースの race_grade を一括 UPDATE。
+
+    同じ開催シリーズなら全12Rが同一グレード（SG/G1/G2/G3/一般）なので、
+    raceresult 1ページ取得 → 12レース分を1回でUPDATEできる。
+
+    Args:
+        hd: YYYYMMDD
+        jcd: 場コード(2桁)
+        grade: SG/G1/G2/G3/一般
+
+    Returns: UPDATEした行数
+    """
+    return _with_retry(
+        f"update_race_grade {hd}_{jcd}",
+        _update_race_grade_inner,
+        hd, jcd, grade,
+    )
+
+
+def _update_race_grade_inner(hd: str, jcd: str, grade: str) -> int:
+    client = _get_client()
+    try:
+        prefix = f"{hd}_{jcd}_"
+        rs = client.execute(
+            "UPDATE race_information SET race_grade = ? WHERE race_code LIKE ? AND race_grade != ?",
+            [grade, prefix + "%", grade],
+        )
+        # libSQL ResultSet.rows_affected
+        return getattr(rs, "rows_affected", 0) or 0
+    finally:
+        client.close()
+
+
 def update_racelist_for_race(race_code: str, lane_data: dict[int, dict]) -> int:
     """既存のrace_resultsに racelist情報をUPDATE（Turso瞬断にはリトライ）"""
     if not lane_data:

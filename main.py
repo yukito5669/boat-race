@@ -61,6 +61,15 @@ def cmd_collect_racelist(args):
     )
 
 
+def cmd_collect_grade(args):
+    from src.collector import collect_missing_grade
+    collect_missing_grade(
+        limit=args.limit,
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
+
+
 def cmd_collect(args):
     if args.date:
         from src.collector import collect_date
@@ -139,6 +148,12 @@ def main():
     p_cr.add_argument("--start-date", help="対象下限 YYYY-MM-DD (inclusive)")
     p_cr.add_argument("--end-date",   help="対象上限 YYYY-MM-DD (inclusive)")
 
+    # collect-grade
+    p_cg = subparsers.add_parser("collect-grade", help="race_grade='一般' のレースを raceresult から再判定して埋め直す (stadium-day単位)")
+    p_cg.add_argument("--limit", type=int, help="処理する最大 stadium-day 数")
+    p_cg.add_argument("--start-date", help="対象下限 YYYY-MM-DD (inclusive)")
+    p_cg.add_argument("--end-date",   help="対象上限 YYYY-MM-DD (inclusive)")
+
     # collect
     p_collect = subparsers.add_parser("collect", help="レースデータ収集")
     p_collect.add_argument("--date", help="日付 (YYYYMMDD)")
@@ -166,6 +181,8 @@ def main():
         cmd_collect_odds(args)
     elif args.command == "collect-racelist":
         cmd_collect_racelist(args)
+    elif args.command == "collect-grade":
+        cmd_collect_grade(args)
     elif args.command == "collect":
         cmd_collect(args)
     elif args.command == "analyze":

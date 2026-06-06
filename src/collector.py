@@ -27,6 +27,7 @@ from src.database import (
     race_exists,
     race_odds_exists,
     save_race_bundle,
+    update_race_grade_for_stadium_day,
     update_racelist_for_race,
 )
 
@@ -214,13 +215,22 @@ def _parse_payouts(soup: BeautifulSoup) -> list[dict]:
 
 
 def _parse_race_grade(soup: BeautifulSoup) -> str:
-    """レースグレードを判定"""
+    """レースグレードを判定。
+
+    BOATRACE公式の `div.heading2_title` に付くクラスを見る:
+      - `is-SGa`             → SG
+      - `is-G1a` / `is-G1b`  → G1 (b は周年記念等のサブ)
+      - `is-G2a` / `is-G2b`  → G2
+      - `is-G3a` / `is-G3b`  → G3
+      - `is-ippan`           → 一般
+
+    クラスは大文字交じり (`is-SGa`) なので、`lower()` してから部分一致で判定する。
+    """
     heading = soup.find("div", class_="heading2_title")
     if not heading:
         return "一般"
 
-    classes = heading.get("class", [])
-    class_str = " ".join(classes)
+    class_str = " ".join(heading.get("class", [])).lower()
 
     if "is-sg" in class_str:
         return "SG"
@@ -621,6 +631,107 @@ def collect_missing_odds(
 
     print(f"\n[完了] 成功: {success}, スキップ: {skipped}", flush=True)
     return success, skipped
+
+
+# ── 公開API: race_grade を後追いで埋め直す ─────────────────────────────────
+
+def collect_missing_grade(
+    limit: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[int, int]:
+    """race_grade='一般' のレースに対して raceresult ページを再 fetch し正しい grade で UPDATE。
+
+    同日同場の全12Rは同一グレードなので **stadium-day 単位で1回 fetch** すれば足りる。
+
+    Args:
+        limit: 処理する最大 stadium-day 数（None=全件）
+        start_date: 対象下限 YYYY-MM-DD
+        end_date:   対象上限 YYYY-MM-DD
+
+    Returns: (UPDATEした stadium-day 数, スキップ数)
+    """
+    from src.database import query_df
+
+    where_parts = ["race_grade = '一般'"]
+    params: list = []
+    if start_date:
+        where_parts.append("race_date >= ?")
+        params.append(start_date)
+    if end_date:
+        where_parts.append("race_date <= ?")
+        params.append(end_date)
+    where_clause = " AND ".join(where_parts)
+
+    df = query_df(
+        f"""
+        SELECT race_date, stadium_code, stadium_name, COUNT(*) AS races
+        FROM race_information
+        WHERE {where_clause}
+        GROUP BY race_date, stadium_code
+        ORDER BY race_date DESC, stadium_code
+        """,
+        params,
+    )
+    if df.empty:
+        print("[grade後追い] 対象 stadium-day なし", flush=True)
+        return 0, 0
+
+    if limit:
+        df = df.head(limit)
+
+    total = len(df)
+    updated, skipped = 0, 0
+    print(f"[grade後追い] 対象: {total} stadium-day", flush=True)
+
+    current_date = None
+    for _, row in df.iterrows():
+        hd = row["race_date"].replace("-", "")
+        jcd = row["stadium_code"]
+        if row["race_date"] != current_date:
+            current_date = row["race_date"]
+            print(f"\n[{current_date}]", flush=True)
+
+        # 一過性ネットワーク失敗は3回まで関数内 _fetch+別ロジックで吸収しないので
+        # ここで grade だけのために dedicated retry をする
+        grade = None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                url = f"{BASE_URL}/raceresult?rno=1&jcd={jcd}&hd={hd}"
+                soup = _fetch(url)
+                if not soup:
+                    break
+                grade = _parse_race_grade(soup)
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                wait = 5 * (attempt + 1)
+                print(f"  [retry {attempt+1}/3] {hd}_{jcd}: {type(e).__name__} -> {wait}s", flush=True)
+                time.sleep(wait)
+
+        if last_exc is not None or not grade:
+            skipped += 1
+            label = type(last_exc).__name__ if last_exc else "no-data"
+            print(f"  [skip] {hd}/{row['stadium_name']}: {label}", flush=True)
+            continue
+
+        # grade が "一般" なら DB はそのままなので UPDATE 不要 → 何もしない
+        if grade == "一般":
+            print(f"  [keep] {hd}/{row['stadium_name']}: 一般 ({row['races']}R)", flush=True)
+            continue
+
+        try:
+            n = update_race_grade_for_stadium_day(hd, jcd, grade)
+            updated += 1
+            print(f"  [OK]   {hd}/{row['stadium_name']}: {grade} ({n}R 更新)", flush=True)
+        except Exception as e:
+            skipped += 1
+            print(f"  [error] {hd}/{row['stadium_name']}: UPDATE {type(e).__name__}", flush=True)
+
+    print(f"\n[完了] 更新: {updated}, スキップ/維持: {total - updated}", flush=True)
+    return updated, skipped
 
 
 # ── 公開API: 既存レースのracelist情報を後追い更新 ───────────────────────────
