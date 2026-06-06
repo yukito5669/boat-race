@@ -1,0 +1,93 @@
+name: Weekly Year Sweep
+
+on:
+  # 毎週月曜日 06:00 JST（= 日曜日 21:00 UTC）に自動実行
+  # 当年(2026...)全期間を再走して、日次ジョブが取りこぼした分を回収する。
+  schedule:
+    - cron: "0 21 * * 0"
+
+  # 手動実行
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "対象年（YYYY、省略時は今年）"
+        required: false
+        default: ""
+      force:
+        description: "強制再取得 (true / false)"
+        required: false
+        default: "false"
+
+# GHA free tier の単一ジョブ上限は 6 時間。当年全レースに 1R 開催確認 fetch が走るので
+# stadium × day × ~3s + 未収集の本実行が嵩む。
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine target year
+        id: params
+        run: |
+          if [ -n "${{ github.event.inputs.year }}" ]; then
+            YEAR="${{ github.event.inputs.year }}"
+          else
+            YEAR="$(date +%Y)"
+          fi
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+
+          echo "year=$YEAR"   >> $GITHUB_OUTPUT
+          echo "force=$FORCE" >> $GITHUB_OUTPUT
+
+      - name: Collect race data (full year sweep)
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        # 当年 1/1 〜 12/31 を date-range で走らせる。既存レースは race_exists で skip。
+        # 各レースの収集には raceresult+racelist+(保持期間内なら)odds3t の fetch が含まれる。
+        run: |
+          YEAR="${{ steps.params.outputs.year }}"
+          ARGS="collect --date-range ${YEAR}-01-01 ${YEAR}-12-31"
+          if [ "${{ steps.params.outputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          echo "実行: python main.py $ARGS"
+          python main.py $ARGS
+
+      - name: Backfill missing odds (3連単確定オッズ)
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        # BOATRACE公式は確定オッズを約25-50日保持。日次ジョブで漏れた分を週次で拾う。
+        run: python main.py collect-odds --limit 1000
+
+      - name: Backfill missing racelist (モーター/ボート/選手ランク/機力指標)
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        # 出走表は長期保持されるので、限界まで取れる。週次でまとめて catch-up。
+        run: python main.py collect-racelist --limit 1000
+
+      - name: Rebuild racer_master from race_results
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: python main.py build-racer-master
+
+      - name: Show DB stats
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: python main.py db-stats

@@ -8,10 +8,30 @@ Turso（libSQL）データベース管理モジュール
 SQLite互換のため ? プレースホルダーをそのまま使用。
 """
 import os
+import time
 from datetime import datetime, timezone
 
 import libsql_client
 import pandas as pd
+
+
+def _with_retry(label: str, fn, *args, max_attempts: int = 10, **kwargs):
+    """Turso/aiohttp の一過性ネットワーク失敗を最大 N 回吸収して fn を再実行。
+
+    待ち時間は 3,6,12,24,48,60,60,60,60,60s（最大 60s cap、合計 ~7 分粘る）。
+    Mac スリープ復帰直後の DNS / Connection reset を耐えるための想定。
+    最終的に失敗したら raise。
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            wait = min(3 * (2 ** (attempt - 1)), 60)
+            print(f"  [DB retry {attempt}/{max_attempts}] {label}: {type(e).__name__} -> {wait}s sleep", flush=True)
+            time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
 
 
 # ── 場コード → 場名 マッピング ──────────────────────────────────────────────
@@ -252,17 +272,13 @@ def insert_race_results(race_code: str, results: list[dict]):
 
 
 def update_racelist_for_race(race_code: str, lane_data: dict[int, dict]) -> int:
-    """既存のrace_resultsに racelist情報（rank/motor/boat と機力率）をUPDATE。
-
-    Args:
-        race_code: 対象レースコード
-        lane_data: {lane: {racer_rank, motor_no, motor_top2_rate, motor_top3_rate,
-                           boat_no, boat_top2_rate, boat_top3_rate}}
-
-    Returns: UPDATEした行数
-    """
+    """既存のrace_resultsに racelist情報をUPDATE（Turso瞬断にはリトライ）"""
     if not lane_data:
         return 0
+    return _with_retry(f"update_racelist {race_code}", _update_racelist_inner, race_code, lane_data)
+
+
+def _update_racelist_inner(race_code: str, lane_data: dict[int, dict]) -> int:
     client = _get_client()
     n = 0
     try:
@@ -326,7 +342,12 @@ def save_race_bundle(
 
     バックフィル時に insert_race_information + insert_race_results + insert_payout_results を
     別々に呼ぶと、Turso接続オープンクローズが3回発生して秒単位の遅延になるためまとめる。
+    Turso瞬断には `_with_retry` で耐性。
     """
+    _with_retry(f"save_race_bundle {race_info.get('race_code')}", _save_race_bundle_inner, race_info, results, payouts)
+
+
+def _save_race_bundle_inner(race_info, results, payouts):
     client = _get_client()
     try:
         stmts: list[tuple[str, list]] = []
@@ -390,9 +411,13 @@ def race_odds_exists(race_code: str) -> bool:
 
 
 def insert_race_odds(race_code: str, odds_list: list[dict]):
-    """1レース分のオッズをバッチ送信（1トランザクションでまとめて投入）。"""
+    """1レース分のオッズをバッチ送信（Turso瞬断にはリトライ）。"""
     if not odds_list:
         return
+    _with_retry(f"insert_race_odds {race_code}", _insert_race_odds_inner, race_code, odds_list)
+
+
+def _insert_race_odds_inner(race_code: str, odds_list: list[dict]):
     client = _get_client()
     try:
         now = datetime.now(timezone.utc).isoformat()

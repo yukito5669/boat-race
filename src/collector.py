@@ -494,26 +494,37 @@ def collect_date(hd: str, stadium_codes: list[str] | None = None, force: bool = 
     for jcd in targets:
         stadium_name = STADIUM_MAP.get(jcd, jcd)
 
-        # 1Rで開催有無を確認
-        url = f"{BASE_URL}/raceresult?rno=1&jcd={jcd}&hd={hd}"
-        soup = _fetch(url)
-        if not soup or not _parse_race_result(soup):
+        # 1Rで開催有無を確認（fetch失敗は致命的でない）
+        try:
+            url = f"{BASE_URL}/raceresult?rno=1&jcd={jcd}&hd={hd}"
+            soup = _fetch(url)
+            if not soup or not _parse_race_result(soup):
+                continue
+        except Exception as e:
+            print(f"  [WARN] {hd} {stadium_name} 1R 開催確認エラー: {type(e).__name__}", flush=True)
             continue
 
-        print(f"\n[{hd}] {stadium_name} ({jcd}):")
+        print(f"\n[{hd}] {stadium_name} ({jcd}):", flush=True)
 
         # 1Rは既にsoupがあるので直接保存
         race_code_1r = f"{hd}_{jcd}_01"
         if force or not race_exists(race_code_1r):
-            if _save_race_from_soup(soup, hd, jcd, 1):
-                total += 1
+            try:
+                if _save_race_from_soup(soup, hd, jcd, 1):
+                    total += 1
+            except Exception as e:
+                print(f"  [WARN] {race_code_1r} 保存スキップ: {type(e).__name__}", flush=True)
 
-        # 2R-12R
+        # 2R-12R: 1レース失敗で全体停止しない
         for rno in range(2, 13):
-            if collect_race(hd, jcd, rno, force=force):
-                total += 1
+            try:
+                if collect_race(hd, jcd, rno, force=force):
+                    total += 1
+            except Exception as e:
+                print(f"  [WARN] {hd}_{jcd}_{rno:02d} 保存スキップ: {type(e).__name__}", flush=True)
+                continue
 
-    print(f"\n[完了] {hd}: {total}レース収集")
+    print(f"\n[完了] {hd}: {total}レース収集", flush=True)
     return total
 
 

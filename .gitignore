@@ -1,8 +1,6 @@
+.DS_Store
 .venv/
 __pycache__/
 *.pyc
-*.pyo
 .env
-data/*.db
-logs/
-.claude/settings*.json
+.claude/
